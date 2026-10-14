@@ -9,7 +9,11 @@
 - 本地开发分支：`codex/ui-foundation`。`origin` 指向个人 fork，`upstream` 指向 `rime/weasel`；不向 upstream 推送。
 - 本机仅拉取和阅读源码、创建文档和工作流。没有执行本机构建、安装输入法、注册 TSF DLL、重新部署或替换已有二进制。
 - 新工作流：[`ui-baseline.yml`](../.github/workflows/ui-baseline.yml)，在云端独立 checkout 原版源码。
-- 首次个人 fork 运行：[Actions run 38558777570](https://github.com/FenChen0211/weasel/actions/runs/38558777570)，工作流提交 `a9761117ecd0ee00b14d377ad50e9afd8431b40a`。**文档初稿时仍在运行；完成后以本节更新及该运行的最终 conclusion 为准。**
+- 首次个人 fork 运行：[Actions run 38558777570](https://github.com/FenChen0211/weasel/actions/runs/38558777570)，工作流提交 `a9761117ecd0ee00b14d377ad50e9afd8431b40a`。**已完成，conclusion=success**；2026-10-14 19:45:05–19:53:07（Asia/Shanghai），空 Boost 缓存首次构建约 8 分钟。
+- x64：57 warnings / 0 errors；Win32：31 warnings / 0 errors。两份 MSBuild 日志均为 Build succeeded，产物完整性、tracked source 与子模块前后版本检查全部通过。保留原版警告，没有为消警告改源码。
+- [二进制、数据和符号](https://github.com/FenChen0211/weasel/actions/runs/38558777570/artifacts/11890728460)：artifact `11890728460`，50,450,719 字节，SHA256 `c5ae48ef8bc07a11b074ebb24761ae7ad5b69eb9109c3abc91600905f90a6c10`，保留至 2026-10-28。
+- [构建证据](https://github.com/FenChen0211/weasel/actions/runs/38558777570/artifacts/11890938217)：artifact `11890938217`，396,219 字节，SHA256 `90dd010975968efaa3c830e7f0b14fec1dacd605dad8164a46f6279b7a8700d8`，保留至 2026-11-13。已下载校验并保存在本地忽略目录 `.cache/actions/38558777570/`，避免远端过期后丢失本次证据。
+- 已读取归档中的 source-sha、build-environment、两份 msbuild 日志及 artifacts-sha256；确认编译源码是原版 `4aea1978...`，VS2022/v143 `14.44.35207`、SDK `10.0.19041.0`、Boost `1.84.0`，子模块前后快照一致。
 
 UI 架构和后续改造边界见 [ui-architecture.md](ui-architecture.md)。
 
@@ -81,10 +85,10 @@ UI 架构和后续改造边界见 [ui-architecture.md](ui-architecture.md)。
 4. 下载固定的 librime 1.17.0 发布包（binary commit `33e7814`），验证四个 SHA256，复制构建所需文件。这里不调用带进程副作用的 get-rime 脚本。librime 预编译版本与源码 gitlink 版本的差别是刻意沿用 upstream CI 的依赖选择，不是改动子模块。
 5. 调用原版 `build.bat data`，plum 的目标目录固定在 runner 的 `output/data`；记录生成的数据 SHA256。
 6. 调用原版 `build.bat weasel`，编译 Release x64 / Win32。
-7. 检查 TSF DLL、Server、Deployer、Setup 和两份 WeaselUI.lib；核验非 output 区域的 tracked source 未变及子模块提交未变；保存完整 tracked diff。
+7. 检查 TSF DLL、Server、Deployer、Setup 和两份 WeaselUI.lib；核验非 output 区域的 tracked source 未变及子模块提交未变；tracked diff 非空时保存补丁。此次 diff 为空，PowerShell 管道没有生成空补丁文件。
 8. 上传 output 中的二进制、数据和符号（14 天），另存工具链、source SHA、submodule SHA、依赖及产物 SHA256、构建日志、生成的 weasel.props（30 天）。失败也上传已有 evidence。
 
-该流程复用仓库原有 WinSparkle 文件，不重编译 upstream CI 的补丁版 WinSparkle 0.9.2；因此这是原版 Weasel 源码的构建基线，不声称与官方安装包逐字节一致。此阶段不产生 NSIS 安装包，不覆盖 ARM / ARM64 / ARM64X，不执行 GUI 或输入功能测试。现有上游 Release 解决方案未启用两个 test 项目的 Release Build.0；单纯 solution build 也不等于运行测试。
+该流程复用仓库原有 WinSparkle 文件（x64 为 0.8.1、Win32 为 0.6.0），不重编译 upstream CI 的补丁版 WinSparkle 0.9.2；因此这是原版 Weasel 源码的构建基线，不声称与官方安装包逐字节一致。此阶段不产生 NSIS 安装包，不覆盖 ARM / ARM64 / ARM64X，不执行 GUI 或输入功能测试。现有上游 Release 解决方案未启用两个 test 项目的 Release Build.0；单纯 solution build 也不等于运行测试。
 
 ### 依赖锁定与可复现范围
 
