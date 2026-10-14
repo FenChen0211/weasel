@@ -1,0 +1,237 @@
+name: UI fork Windows baseline
+
+run-name: Windows Release ${{ inputs.target || 'baseline' }} by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Build the pinned upstream baseline or this fork revision
+        type: choice
+        options: [baseline, fork]
+        default: baseline
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-baseline-${{ github.ref }}-${{ inputs.target || 'baseline' }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: source
+    env:
+      BOOST_ROOT: ${{ github.workspace }}\source\deps\boost_1_84_0
+      SDKVER: 10.0.19041.0
+      boost_version: 1.84.0
+
+    steps:
+      # Build source is checked out separately from the workflow definition.
+      # baseline always compiles the exact, unmodified upstream revision.
+      - name: Checkout build source recursively
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ inputs.target == 'fork' && github.repository || 'rime/weasel' }}
+          ref: ${{ inputs.target == 'fork' && github.sha || '4aea1978a351e2ce41af20c8fb88a01ce9802de8' }}
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Activate VS2022 before compiling any dependency
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          vsversion: '2022'
+          arch: x64
+          sdk: '10.0.19041.0'
+
+      - name: Verify toolchain and record source
+        id: toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true') { throw 'This build is for GitHub Actions only.' }
+          if ($env:VisualStudioVersion -notlike '17.*') { throw 'VS2022 is required.' }
+          foreach ($header in @('atlbase.h', 'afxwin.h')) {
+            if (!(Test-Path (Join-Path $env:VCToolsInstallDir "atlmfc\include\$header"))) {
+              throw "Missing ATL/MFC header: $header"
+            }
+          }
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          Copy-Item env.vs2022.bat env.bat
+          git rev-parse HEAD | Set-Content evidence/source-sha.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve source revision.' }
+          $submodules = @(git submodule status --recursive)
+          if ($LASTEXITCODE -ne 0 -or @($submodules | Where-Object { $_ -match '^[+\-U]' }).Count) {
+            throw 'Submodules are not all at their recorded revisions.'
+          }
+          $submodules | Set-Content evidence/submodules.txt
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and '${{ inputs.target }}' -eq 'baseline') {
+            if ((Get-Content evidence/source-sha.txt) -ne '4aea1978a351e2ce41af20c8fb88a01ce9802de8') {
+              throw 'Unexpected baseline revision.'
+            }
+          }
+          msbuild -version | Set-Content evidence/msbuild-version.txt
+          if ($LASTEXITCODE -ne 0) { throw 'MSBuild is not available.' }
+          "vctools=$($env:VCToolsVersion.Trim())" | Add-Content $env:GITHUB_OUTPUT
+          [ordered]@{
+            source = (Get-Content evidence/source-sha.txt)
+            workflow_revision = $env:GITHUB_SHA
+            runner_image = $env:ImageOS
+            runner_version = $env:ImageVersion
+            visual_studio = $env:VisualStudioVersion
+            vc_tools = $env:VCToolsVersion
+            sdk = $env:WindowsSDKVersion
+            boost = $env:boost_version
+            librime_release = '1.17.0'
+            librime_binary_commit = '33e7814'
+            platforms = @('x64', 'Win32')
+          } | ConvertTo-Json | Set-Content evidence/build-environment.json
+          # Select Git Bash explicitly instead of Windows' optional WSL bash.
+          'C:\Program Files\Git\bin' | Add-Content $env:GITHUB_PATH
+
+      - name: Cache Boost source and x64/Win32 static libraries
+        id: boost
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.BOOST_ROOT }}
+          key: windows-2022-boost-1.84.0-v143-${{ steps.toolchain.outputs.vctools }}-sdk19041-x64-win32-${{ hashFiles('source/build.bat') }}
+
+      - name: Build Boost on the hosted runner
+        if: steps.boost.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force deps | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP 'boost_1_84_0.7z'
+          Invoke-WebRequest 'https://archives.boost.io/release/1.84.0/source/boost_1_84_0.7z' -OutFile $archive
+          $expected = '81a4d10075731966477276c47324ecd9cac02da49899d36c48eba66e40014f25'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'Boost SHA256 mismatch.'
+          }
+          7z x $archive '-odeps' -y > evidence/boost-extract.log
+          if ($LASTEXITCODE -ne 0) { throw 'Boost extraction failed.' }
+          & .\build.bat boost *> evidence/boost-build.log
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content evidence/boost-build.log -Tail 100
+            throw 'Boost build failed.'
+          }
+
+      - name: Prepare pinned librime binaries without installing anything
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The same release used by the verified upstream CI run, not a moving nightly.
+          # Avoid get-rime.ps1 -use dev: it also kills local WeaselServer processes.
+          $packages = @(
+            @{name='rime-33e7814-Windows-msvc-x64.7z'; arch='x64'; sha256='7478c7caa4ff6b37de86daba1f7ce4a994a4f5ba24872a820fb2b3a9b01fed15'},
+            @{name='rime-33e7814-Windows-msvc-x86.7z'; arch='x86'; sha256='af235c26c06152ce09ceb8fe9d9ab9fba7ab43ce30aa952b40174d806f5cc3d9'},
+            @{name='rime-deps-33e7814-Windows-msvc-x64.7z'; arch='x64'; sha256='9ef5608d8a54ff52bbad7a9b4128de42b232f8e3dd1f5fd3bff42a0b1bacd7e8'},
+            @{name='rime-deps-33e7814-Windows-msvc-x86.7z'; arch='x86'; sha256='9e32e662c032be452a06f13ae3c00118d197d7c8df5f45795f472e318083ab20'}
+          )
+          $packages | ConvertTo-Json | Set-Content evidence/librime-packages.json
+          foreach ($package in $packages) {
+            $archive = Join-Path $env:RUNNER_TEMP $package.name
+            $destination = Join-Path $env:RUNNER_TEMP "weasel-rime-$($package.arch)"
+            Invoke-WebRequest "https://github.com/rime/librime/releases/download/1.17.0/$($package.name)" -OutFile $archive
+            if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $package.sha256) {
+              throw "librime SHA256 mismatch: $($package.name)"
+            }
+            7z x $archive "-o$destination" -y | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Extraction failed: $($package.name)" }
+          }
+          $x64 = Join-Path $env:RUNNER_TEMP 'weasel-rime-x64'
+          $x86 = Join-Path $env:RUNNER_TEMP 'weasel-rime-x86'
+          Copy-Item "$x86\dist\include\rime_*.h" include
+          Copy-Item "$x86\dist\lib\rime.lib" lib
+          Copy-Item "$x64\dist\lib\rime.lib" lib64
+          Copy-Item "$x86\dist\lib\rime.dll" output/Win32
+          Copy-Item "$x64\dist\lib\rime.dll" output
+          New-Item -ItemType Directory -Force output/data/opencc | Out-Null
+          Copy-Item "$x64\share\opencc\*" output/data/opencc
+          # Use the original repository's WinSparkle binaries; no updater patching.
+          foreach ($file in @('include/rime_api.h', 'lib/rime.lib', 'lib64/rime.lib',
+              'output/rime.dll', 'output/Win32/rime.dll', 'output/data/opencc/TSCharacters.ocd2',
+              'output/WinSparkle.dll', 'output/Win32/WinSparkle.dll')) {
+            if (!(Test-Path $file)) { throw "Missing build dependency: $file" }
+          }
+
+      - name: Build original bundled data in the runner workspace
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\build.bat data *> evidence/data-build.log
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path output/data/essay.txt)) {
+            Get-Content evidence/data-build.log -Tail 100
+            throw 'Bundled data build failed.'
+          }
+          # Dictionaries are fetched by upstream plum recipes; record their exact contents.
+          Get-ChildItem output/data -File -Recurse | Sort-Object FullName | ForEach-Object {
+            [ordered]@{path=[IO.Path]::GetRelativePath((Get-Location).Path, $_.FullName); sha256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash}
+          } | ConvertTo-Json | Set-Content evidence/data-sha256.json
+
+      - name: Build unmodified Weasel Release x64 and Win32
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\build.bat weasel *> evidence/weasel-build.log
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content evidence/weasel-build.log -Tail 150
+            throw 'Weasel build failed.'
+          }
+          Get-Content evidence/weasel-build.log -Tail 40
+
+      - name: Verify artifacts and unchanged tracked source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in @('output/WeaselServer.exe', 'output/WeaselDeployer.exe',
+              'output/WeaselSetup.exe', 'output/Win32/WeaselServer.exe',
+              'output/Win32/WeaselDeployer.exe', 'output/weasel.dll', 'output/weaselx64.dll',
+              'msbuild/Release/x64/WeaselUI.lib', 'msbuild/Release/Win32/WeaselUI.lib')) {
+            if (!(Test-Path $file) -or (Get-Item $file).Length -eq 0) { throw "Missing artifact: $file" }
+          }
+          git diff --exit-code HEAD -- . ':!output'
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked source changed during build.' }
+          # build.bat data copies tracked output scripts. Permit these generated data changes,
+          # but still preserve the complete diff for inspection.
+          git diff HEAD | Set-Content evidence/tracked-diff.patch
+          git submodule status --recursive | Set-Content evidence/submodules-after.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify submodules.' }
+          if (Compare-Object (Get-Content evidence/submodules.txt) (Get-Content evidence/submodules-after.txt)) {
+            throw 'Submodule revision changed during build.'
+          }
+          Get-ChildItem output -File -Recurse | Where-Object { $_.Extension -in @('.exe', '.dll', '.pdb') } |
+            Sort-Object FullName | ForEach-Object {
+              [ordered]@{path=[IO.Path]::GetRelativePath((Get-Location).Path, $_.FullName); sha256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash}
+            } | ConvertTo-Json | Set-Content evidence/artifacts-sha256.json
+          $sha = Get-Content evidence/source-sha.txt
+          "Built $sha with VS2022/v143, Release x64 + Win32. No installation or runtime test was performed." |
+            Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload binaries and symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: weasel-${{ inputs.target || 'baseline' }}-windows-release-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            source/output/**
+            !source/output/**/*.lib
+            !source/output/**/*.exp
+            !source/output/**/*.ilk
+            !source/output/**/*.iobj
+            !source/output/**/*.ipdb
+
+      - name: Upload build evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: weasel-build-evidence-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            source/evidence/**
+            source/msbuild*.log
+            source/weasel.props
